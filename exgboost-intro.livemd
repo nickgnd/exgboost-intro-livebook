@@ -1,0 +1,523 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Introducing EXGBoost: Gradient Boosting in Elixir
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.5"},
+  {:exgboost, "~> 0.2.1"},
+  {:scholar, "~> 0.1"},
+  {:explorer, "~> 0.5"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1.7"}
+])
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Intro
+
+Livebook version of https://dockyard.com/blog/2023/07/18/introducing-exgboost-gradient-boosting-in-elixir blog post with some more data analysis.
+
+* Make sure you install `EXGBoost` requirements https://github.com/acalejos/exgboost/#requirements before
+
+## Prepare the Data
+
+```elixir
+# Let's read the dataset
+path =
+  __DIR__
+  |> Path.join("diamonds.csv")
+  |> Path.expand()
+
+df = Explorer.DataFrame.from_csv!(path)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[53940 x 11]
+   integer [1, 2, 3, 4, 5, ...]
+  carat float [0.23, 0.21, 0.23, 0.29, 0.31, ...]
+  cut string ["Ideal", "Premium", "Good", "Premium", "Good", ...]
+  color string ["E", "E", "E", "I", "J", ...]
+  clarity string ["SI2", "SI1", "VS1", "VS2", "SI2", ...]
+  depth float [61.5, 59.8, 56.9, 62.4, 63.3, ...]
+  table float [55.0, 61.0, 65.0, 58.0, 58.0, ...]
+  price integer [326, 326, 327, 334, 335, ...]
+  x float [3.95, 3.89, 4.05, 4.2, 4.34, ...]
+  y float [3.98, 3.84, 4.07, 4.23, 4.35, ...]
+  z float [2.43, 2.31, 2.31, 2.63, 2.75, ...]
+>
+```
+
+```elixir
+require Explorer.DataFrame, as: DF
+
+# Discard the ID column (1st column)
+df = DF.discard(df, 0)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[53940 x 10]
+  carat float [0.23, 0.21, 0.23, 0.29, 0.31, ...]
+  cut string ["Ideal", "Premium", "Good", "Premium", "Good", ...]
+  color string ["E", "E", "E", "I", "J", ...]
+  clarity string ["SI2", "SI1", "VS1", "VS2", "SI2", ...]
+  depth float [61.5, 59.8, 56.9, 62.4, 63.3, ...]
+  table float [55.0, 61.0, 65.0, 58.0, 58.0, ...]
+  price integer [326, 326, 327, 334, 335, ...]
+  x float [3.95, 3.89, 4.05, 4.2, 4.34, ...]
+  y float [3.98, 3.84, 4.07, 4.23, 4.35, ...]
+  z float [2.43, 2.31, 2.31, 2.63, 2.75, ...]
+>
+```
+
+```elixir
+# Numerically encode the values in the string columns
+# before converting the dataframe to a tensor
+df =
+  DF.mutate(
+    df,
+    for col <- across(~w[cut color clarity]) do
+      {col.name, Explorer.Series.cast(col, :category)}
+    end
+  )
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[53940 x 10]
+  carat float [0.23, 0.21, 0.23, 0.29, 0.31, ...]
+  cut category ["Ideal", "Premium", "Good", "Premium", "Good", ...]
+  color category ["E", "E", "E", "I", "J", ...]
+  clarity category ["SI2", "SI1", "VS1", "VS2", "SI2", ...]
+  depth float [61.5, 59.8, 56.9, 62.4, 63.3, ...]
+  table float [55.0, 61.0, 65.0, 58.0, 58.0, ...]
+  price integer [326, 326, 327, 334, 335, ...]
+  x float [3.95, 3.89, 4.05, 4.2, 4.34, ...]
+  y float [3.98, 3.84, 4.07, 4.23, 4.35, ...]
+  z float [2.43, 2.31, 2.31, 2.63, 2.75, ...]
+>
+```
+
+```elixir
+# We can see that the data type of the string columns `cut`, `color` and `clarity`
+# is now `:category`, which is represented internally as integer.
+
+df["cut"] |> Explorer.Series.dtype()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:category
+```
+
+```elixir
+# Shuffle data and split into training (80%) and test (20%) sets
+
+n_rows = DF.n_rows(df)
+split_at = floor(0.8 * n_rows)
+
+df = DF.shuffle(df)
+train_df = DF.slice(df, 0..split_at)
+test_df = DF.slice(df, split_at..-1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[10788 x 10]
+  carat float [1.02, 0.41, 2.12, 1.0, 1.02, ...]
+  cut category ["Ideal", "Ideal", "Premium", "Very Good", "Premium", ...]
+  color category ["E", "F", "E", "E", "F", ...]
+  clarity category ["SI2", "VS2", "SI2", "SI2", "SI2", ...]
+  depth float [62.9, 62.7, 58.3, 60.6, 62.5, ...]
+  table float [57.0, 56.0, 59.0, 61.0, 60.0, ...]
+  price integer [4798, 1107, 18120, 4312, 4541, ...]
+  x float [6.44, 4.78, 8.48, 6.39, 6.43, ...]
+  y float [6.38, 4.72, 8.41, 6.44, 6.36, ...]
+  z float [4.03, 2.98, 4.92, 3.89, 4.0, ...]
+>
+```
+
+```elixir
+# Convert both train and test data frames into tensors
+
+# Select the features columns and the targets ones
+features = ~w(carat cut color clarity depth table x y z)
+targets = ~w(price)
+
+# Stack the columns values along the y axis,
+# think of it like Excel columns
+
+x_train =
+  train_df[features]
+  |> Nx.stack(axis: 1)
+
+y_train =
+  train_df[targets]
+  |> Nx.stack(axis: 1)
+
+x_test =
+  test_df[features]
+  |> Nx.stack(axis: 1)
+
+y_test =
+  test_df[targets]
+  |> Nx.stack(axis: 1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Nx.Tensor<
+  s64[10788][1]
+  [
+    [4798],
+    [1107],
+    [18120],
+    [4312],
+    [4541],
+    [8146],
+    [6098],
+    [9891],
+    [1817],
+    [2041],
+    [12119],
+    [16390],
+    [666],
+    [881],
+    [5208],
+    [1192],
+    [477],
+    [5394],
+    [7340],
+    [3205],
+    [4136],
+    [5701],
+    [928],
+    [4843],
+    [7781],
+    [984],
+    [1119],
+    [4854],
+    [11999],
+    [9678],
+    [2732],
+    [755],
+    [3096],
+    [1578],
+    [2803],
+    [3246],
+    [7999],
+    [1175],
+    [2475],
+    [7140],
+    [13355],
+    [4751],
+    [7006],
+    [673],
+    [2105],
+    [756],
+    [844],
+    [1824],
+    [4731],
+    [6449],
+    ...
+  ]
+>
+```
+
+## Train the model
+
+```elixir
+# The objective is the metric or loss function used to optimize the model.
+# In this case, our objective is a regression, so we’ll use the squared-error loss.
+
+model = EXGBoost.train(x_train, y_train, obj: :reg_squarederror)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%EXGBoost.Booster{
+  ref: #Reference<0.1257637143.4252368897.206621>,
+  best_iteration: nil,
+  best_score: nil
+}
+```
+
+```elixir
+# Then, we can specify an evaluation strategy to evaluate the model
+# during the training, we can use the same training set.
+
+model =
+  EXGBoost.train(x_train, y_train,
+    obj: :reg_squarederror,
+    evals: [{x_train, y_train, "train"}]
+  )
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Iteration 0: %{"train" => %{"rmse" => 2890.7208712453144}}
+Iteration 1: %{"train" => %{"rmse" => 2134.0191851392415}}
+Iteration 2: %{"train" => %{"rmse" => 1615.3131846345257}}
+Iteration 3: %{"train" => %{"rmse" => 1260.5302513690365}}
+Iteration 4: %{"train" => %{"rmse" => 1035.273912577993}}
+Iteration 5: %{"train" => %{"rmse" => 878.4874980899773}}
+Iteration 6: %{"train" => %{"rmse" => 784.2830805904829}}
+Iteration 7: %{"train" => %{"rmse" => 712.8615971753834}}
+Iteration 8: %{"train" => %{"rmse" => 668.4144474681958}}
+Iteration 9: %{"train" => %{"rmse" => 638.9102413425762}}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%EXGBoost.Booster{
+  ref: #Reference<0.1257637143.4252368897.206645>,
+  best_iteration: nil,
+  best_score: nil
+}
+```
+
+```elixir
+# By default it stops after 10 iterations, but we can configure it
+
+model =
+  EXGBoost.train(x_train, y_train,
+    obj: :reg_squarederror,
+    evals: [{x_train, y_train, "train"}],
+    num_boost_rounds: 15
+  )
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Iteration 0: %{"train" => %{"rmse" => 2890.7208712453144}}
+Iteration 1: %{"train" => %{"rmse" => 2134.0191851392415}}
+Iteration 2: %{"train" => %{"rmse" => 1615.3131846345257}}
+Iteration 3: %{"train" => %{"rmse" => 1260.5302513690365}}
+Iteration 4: %{"train" => %{"rmse" => 1035.273912577993}}
+Iteration 5: %{"train" => %{"rmse" => 878.4874980899773}}
+Iteration 6: %{"train" => %{"rmse" => 784.2830805904829}}
+Iteration 7: %{"train" => %{"rmse" => 712.8615971753834}}
+Iteration 8: %{"train" => %{"rmse" => 668.4144474681958}}
+Iteration 9: %{"train" => %{"rmse" => 638.9102413425762}}
+Iteration 10: %{"train" => %{"rmse" => 615.9900670364887}}
+Iteration 11: %{"train" => %{"rmse" => 603.5636994455643}}
+Iteration 12: %{"train" => %{"rmse" => 589.9516549997495}}
+Iteration 13: %{"train" => %{"rmse" => 576.5182045827278}}
+Iteration 14: %{"train" => %{"rmse" => 564.2201739403405}}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%EXGBoost.Booster{
+  ref: #Reference<0.1257637143.4252368897.206680>,
+  best_iteration: nil,
+  best_score: nil
+}
+```
+
+## Prediction
+
+```elixir
+y_pred = EXGBoost.predict(model, x_test)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Nx.Tensor<
+  f32[10788]
+  [4738.07568359375, 1002.7467041015625, 16921.232421875, 4359.3779296875, 4242.79638671875, 8761.689453125, 6005.74560546875, 9416.0615234375, 2289.523193359375, 1795.5733642578125, 14965.5625, 16371.611328125, 767.2431030273438, 851.5617065429688, 6894.3076171875, 1142.4537353515625, 559.9784545898438, 3998.229736328125, 7741.77880859375, 2536.752197265625, 4005.88427734375, 5831.16015625, 815.0265502929688, 4759.9404296875, 7482.3984375, 989.0425415039062, 1212.652099609375, 5602.09912109375, 11887.0732421875, 10879.662109375, 3153.29638671875, 928.280517578125, 3044.616455078125, 1689.5523681640625, 3985.532470703125, 3343.437744140625, 7342.908203125, 1276.2225341796875, 2740.32763671875, 8790.6376953125, 13003.0791015625, 4511.625, 8770.1650390625, 747.6937866210938, 1936.9466552734375, 718.6131591796875, 966.3662109375, 1207.0413818359375, 4030.13134765625, 5668.5859375, ...]
+>
+```
+
+```elixir
+# We can use Scholar to evaluate these predictions
+
+Scholar.Metrics.mean_absolute_error(Nx.squeeze(y_test), y_pred)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Nx.Tensor<
+  f32
+  327.4473876953125
+>
+```
+
+```elixir
+# Pairwise errors
+
+pairwise_errors = Nx.abs(Nx.subtract(Nx.squeeze(y_test), y_pred))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Nx.Tensor<
+  f32[10788]
+  [59.92431640625, 104.2532958984375, 1198.767578125, 47.3779296875, 298.20361328125, 615.689453125, 92.25439453125, 474.9384765625, 472.523193359375, 245.4266357421875, 2846.5625, 18.388671875, 101.24310302734375, 29.43829345703125, 1686.3076171875, 49.5462646484375, 82.97845458984375, 1395.770263671875, 401.77880859375, 668.247802734375, 130.11572265625, 130.16015625, 112.97344970703125, 83.0595703125, 298.6015625, 5.04254150390625, 93.652099609375, 748.09912109375, 111.9267578125, 1201.662109375, 421.29638671875, 173.280517578125, 51.383544921875, 111.5523681640625, 1182.532470703125, 97.437744140625, 656.091796875, 101.2225341796875, 265.32763671875, 1650.6376953125, 351.9208984375, 239.375, 1764.1650390625, 74.69378662109375, 168.0533447265625, 37.3868408203125, 122.3662109375, 616.9586181640625, 700.86865234375, 780.4140625, ...]
+>
+```
+
+```elixir
+Nx.reduce_min(pairwise_errors) |> IO.inspect(label: "min error:")
+Nx.reduce_max(pairwise_errors) |> IO.inspect(label: "max error:")
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+min error:: #Nx.Tensor<
+  f32
+  0.01019287109375
+>
+max error:: #Nx.Tensor<
+  f32
+  7115.482421875
+>
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# We can even think to compute the distribution of the error
+
+# In order to do so, we first need to define the range
+# and given that the min is 0.0023193359375 and the max
+# is 6555.39453125
+
+min = 0
+max = 7000
+bins = Enum.to_list(0..7000//250)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000,
+ 4250, 4500, 4750, 5000, 5250, 5500, 5750, 6000, 6250, 6500, 6750, 7000]
+```
+
+```elixir
+# With our bins we can now compute the distributions of the pairwise_errors
+
+# First convert the pairwise_errors tensor to a serie
+# (the type cast is necessary to work-around this error: "Cannot convert binary/tensor type {:f, 32} into dtype")
+
+errors_serie =
+  pairwise_errors
+  |> Nx.as_type({:f, 64})
+  |> Explorer.Series.from_tensor()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.Series<
+  Polars[10788]
+  float [59.92431640625, 104.2532958984375, 1198.767578125, 47.3779296875, 298.20361328125,
+   615.689453125, 92.25439453125, 474.9384765625, 472.523193359375, 245.4266357421875, 2846.5625,
+   18.388671875, 101.24310302734375, 29.43829345703125, 1686.3076171875, 49.5462646484375,
+   82.97845458984375, 1395.770263671875, 401.77880859375, 668.247802734375, 130.11572265625,
+   130.16015625, 112.97344970703125, 83.0595703125, 298.6015625, 5.04254150390625, 93.652099609375,
+   748.09912109375, 111.9267578125, 1201.662109375, 421.29638671875, 173.280517578125,
+   51.383544921875, 111.5523681640625, 1182.532470703125, 97.437744140625, 656.091796875,
+   101.2225341796875, 265.32763671875, 1650.6376953125, 351.9208984375, 239.375, 1764.1650390625,
+   74.69378662109375, 168.0533447265625, 37.3868408203125, 122.3662109375, 616.9586181640625,
+   700.86865234375, 780.4140625, ...]
+>
+```
+
+```elixir
+# Let's then sort the errors serie and cut it into the defined bins
+# using the `Explorer.Series.cut` function
+
+histogram_df =
+  errors_serie
+  |> Explorer.Series.sort()
+  |> Explorer.Series.cut(bins)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[10788 x 3]
+  values float [0.01019287109375, 0.01025390625, 0.01025390625, 0.040771484375, 0.15478515625, ...]
+  break_point float [250.0, 250.0, 250.0, 250.0, 250.0, ...]
+  category category ["(0.0, 250.0]", "(0.0, 250.0]", "(0.0, 250.0]", "(0.0, 250.0]", "(0.0, 250.0]",
+   ...]
+>
+```
+
+```elixir
+# The errors distribution is the frequencies on the `category` column
+
+distribution_df = Explorer.Series.frequencies(histogram_df["category"])
+
+categories = Explorer.Series.to_list(distribution_df["values"])
+counts = Explorer.Series.to_list(distribution_df["counts"])
+
+data = %{categories: categories, counts: counts}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%{
+  categories: ["(0.0, 250.0]", "(250.0, 500.0]", "(500.0, 750.0]", "(750.0, 1000.0]",
+   "(1000.0, 1250.0]", "(1250.0, 1500.0]", "(1500.0, 1750.0]", "(2000.0, 2250.0]",
+   "(1750.0, 2000.0]", "(2250.0, 2500.0]", "(2500.0, 2750.0]", "(2750.0, 3000.0]",
+   "(3000.0, 3250.0]", "(3250.0, 3500.0]", "(3750.0, 4000.0]", "(3500.0, 3750.0]",
+   "(4000.0, 4250.0]", "(4250.0, 4500.0]", "(4500.0, 4750.0]", "(5500.0, 5750.0]",
+   "(5000.0, 5250.0]", "(7000.0, inf]"],
+  counts: [7184, 1643, 737, 398, 235, 163, 125, 75, 71, 36, 33, 28, 16, 16, 8, 7, 5, 2, 2, 2, 1, 1]
+}
+```
+
+```elixir
+VegaLite.new(title: "Error distribution")
+|> VegaLite.data_from_values(data, only: ["categories", "counts"])
+|> VegaLite.mark(:bar, tooltip: true)
+# specify the `:sort` options to enforce it
+|> VegaLite.encode(:x, field: "categories", type: :nominal, sort: categories)
+|> VegaLite.encode_field(:y, "counts", type: :quantitative)
+|> VegaLite.encode_field(:color, "categories", type: :nominal)
+```
+
+<!-- livebook:{"output":true} -->
+
+```vega-lite
+{"$schema":"https://vega.github.io/schema/vega-lite/v5.json","data":{"values":[{"categories":"(0.0, 250.0]","counts":7184},{"categories":"(250.0, 500.0]","counts":1643},{"categories":"(500.0, 750.0]","counts":737},{"categories":"(750.0, 1000.0]","counts":398},{"categories":"(1000.0, 1250.0]","counts":235},{"categories":"(1250.0, 1500.0]","counts":163},{"categories":"(1500.0, 1750.0]","counts":125},{"categories":"(2000.0, 2250.0]","counts":75},{"categories":"(1750.0, 2000.0]","counts":71},{"categories":"(2250.0, 2500.0]","counts":36},{"categories":"(2500.0, 2750.0]","counts":33},{"categories":"(2750.0, 3000.0]","counts":28},{"categories":"(3000.0, 3250.0]","counts":16},{"categories":"(3250.0, 3500.0]","counts":16},{"categories":"(3750.0, 4000.0]","counts":8},{"categories":"(3500.0, 3750.0]","counts":7},{"categories":"(4000.0, 4250.0]","counts":5},{"categories":"(4250.0, 4500.0]","counts":2},{"categories":"(4500.0, 4750.0]","counts":2},{"categories":"(5500.0, 5750.0]","counts":2},{"categories":"(5000.0, 5250.0]","counts":1},{"categories":"(7000.0, inf]","counts":1}]},"encoding":{"color":{"field":"categories","type":"nominal"},"x":{"field":"categories","sort":["(0.0, 250.0]","(250.0, 500.0]","(500.0, 750.0]","(750.0, 1000.0]","(1000.0, 1250.0]","(1250.0, 1500.0]","(1500.0, 1750.0]","(2000.0, 2250.0]","(1750.0, 2000.0]","(2250.0, 2500.0]","(2500.0, 2750.0]","(2750.0, 3000.0]","(3000.0, 3250.0]","(3250.0, 3500.0]","(3750.0, 4000.0]","(3500.0, 3750.0]","(4000.0, 4250.0]","(4250.0, 4500.0]","(4500.0, 4750.0]","(5500.0, 5750.0]","(5000.0, 5250.0]","(7000.0, inf]"],"type":"nominal"},"y":{"field":"counts","type":"quantitative"}},"mark":{"tooltip":true,"type":"bar"},"title":"Error distribution"}
+```
+
+The graph of the errors distribution does not give us new informations, knowning that the mean error is around 330$ is probably enough, nevertherless it was a fun ride. 🎉
